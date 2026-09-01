@@ -178,6 +178,8 @@ Required or recommended directories:
 | `mmaps` | Strongly recommended for Playerbots |
 | `cameras` | Recommended |
 
+Copy the required extractor executables, `mmaps-config.yaml` into the WoW 3.3.5a client directory beside `Wow.exe`. Run 1) map_extractor 2) vmap4_extractor 3) vmap4_assembler 4) mmap_generator there and allow every selected extraction stage to finish.
+
 The extractor executables are compiled into:
 
 ```text
