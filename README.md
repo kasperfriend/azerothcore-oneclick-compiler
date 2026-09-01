@@ -2,6 +2,8 @@
 
 A Windows batch/PowerShell installer that downloads the required build tools, compiles AzerothCore with Playerbots, prepares a portable MySQL database, and generates launch scripts.
 
+Any contributions are appreciated!
+
 It uses the required Playerbots-compatible AzerothCore fork:
 
 - [mod-playerbots/azerothcore-wotlk](https://github.com/mod-playerbots/azerothcore-wotlk), `Playerbot` branch
