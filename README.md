@@ -24,17 +24,20 @@ Keep the BAT and PS1 files together in the same directory.
 - 64-bit Windows
 - Administrator access
 - Internet connection
-- Several gigabytes of free disk space
+- About 40 GB of free disk space: roughly 15 GB for the Visual Studio C++ Build Tools and its package cache, plus Boost, OpenSSL, MySQL, the sources and the build output. The script refuses to start the Visual Studio installation when less than 12 GB is free on the relevant drive.
+- A local NTFS drive. Network shares, removable drives and substituted (`subst`) drives are rejected by the Visual Studio installer.
 - A legally obtained World of Warcraft 3.3.5a client, build 12340, for client-data extraction or pre-extracted data files from *elsewhere*
 
 ## Quick start
 
 1. Download or clone this repository.
-2. Place it in the directory where you want the complete installation. A short path is recommended, for example:
+2. Place it in the directory where you want the complete installation. A short path without spaces or non-ASCII characters is strongly recommended, for example:
 
    ```text
    E:\ACore
    ```
+
+   Avoid leaving it in a deep download folder such as `C:\Users\NAME\Downloads\azerothcore-oneclick-compiler-main`, because the Visual Studio installer and the MSVC toolchain work with paths far below that folder.
 
 3. Double-click:
 
@@ -265,9 +268,10 @@ Important files include:
 logs\install.log
 logs\transcript.log
 logs\mysql-error.log
+logs\vsinstaller
 ```
 
-When reporting a setup failure, include `install.log` and `transcript.log`. If MySQL fails, also include `mysql-error.log`.
+When reporting a setup failure, include `install.log` and `transcript.log`. If MySQL fails, also include `mysql-error.log`. If the Visual Studio installation fails, also include the whole `logs\vsinstaller` folder.
 
 ## Security notes
 
@@ -288,6 +292,59 @@ Run the BAT rather than opening the PS1 directly. Keep both files in the same di
 
 The script automatically tries HTTP, BITS, and curl where available. Check internet filtering, antivirus, VPN, proxy, and available disk space. Partial or invalid pinned downloads are rejected.
 
+### Visual Studio Build Tools installation fails
+
+The script needs the Visual Studio 2022 x64 C++ toolset (`Microsoft.VisualStudio.Component.VC.Tools.x86.x64`). If a suitable toolset is already present, nothing is downloaded or installed.
+
+When the installation fails, the script now reports exactly what happened:
+
+- the free disk space on the installation, cache and `%TEMP%` drives,
+- whether the target directory itself is usable for Visual Studio,
+- a pending Windows restart, a non-writable `%TEMP%`, or a blocked Microsoft download endpoint,
+- the exit code of every attempt, translated into plain language,
+- the failing lines from the Microsoft installer logs, which are copied into `logs\vsinstaller`.
+
+The target directory is validated before the installer runs, because Visual Studio rejects unsuitable directories with error `8004` without explaining why. The portable `Dependencies\VSBuildTools` location is skipped when it is:
+
+- on a network share, a removable drive, or a substituted (`subst`) drive,
+- on a volume that is not NTFS,
+- inside a folder that cannot be written to,
+- longer than 120 characters (a warning is already shown above 80 characters),
+- containing non-ASCII characters (warning).
+
+In those cases Build Tools is installed into the default system location, `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools`, instead. Moving the whole compiler to a short local path such as `E:\ACore` keeps the portable layout working.
+
+It then automatically retries with a different strategy before giving up:
+
+1. Add the C++ toolset to an existing Visual Studio 2022 installation.
+2. Install Build Tools into `Dependencies\VSBuildTools` with a progress window.
+3. Install Build Tools into `Dependencies\VSBuildTools` with no user interface.
+4. Install Build Tools into the default system location without the download cache.
+5. Install Build Tools through `winget`, when `winget` is available.
+
+Steps 2 and 3 are skipped once the target directory has been rejected, and retries are skipped entirely when they cannot help, for example when the installation was canceled, when a restart is required, or when the Microsoft servers cannot be reached.
+
+Common exit codes reported by the Microsoft bootstrapper:
+
+| Exit code | Meaning | What to do |
+| --- | --- | --- |
+| `1`, `-1`, `1603` | Generic failure | Read `logs\vsinstaller`; the cause is named there. |
+| `740` | Elevation required | Run the BAT and approve the Administrator prompt. |
+| `1001`, `1618` | Another installation is running | Close the other installer and wait; the script also waits automatically. |
+| `1003`, `8006` | Visual Studio is in use | Close every Visual Studio window. |
+| `1602`, `5004` | Canceled | Do not close the installer window; run the script again. |
+| `3010`, `1641` | Succeeded, restart required | Restart Windows, then run the script again. |
+| `5003`, `-1073720687` | Microsoft servers unreachable | Allow `aka.ms`, `download.visualstudio.microsoft.com` and `*.vsassets.io` in the proxy, firewall, DNS filter and antivirus. |
+| `5007`, `8010` | Requirements not met | Install current Windows updates; Windows 10/11 x64 is required. |
+| `8004` | Target directory failure | The script now detects the usual causes up front and falls back to the default location. Otherwise move the compiler to a short local NTFS path such as `E:\ACore`, avoid network/removable/`subst` drives, and delete a leftover `Dependencies\VSBuildTools`. |
+| `8005` | Corrupt cached package | Delete `Dependencies\Downloads` and run the script again. |
+
+If nothing helps, install Build Tools manually once:
+
+1. Download [Build Tools for Visual Studio 2022](https://aka.ms/vs/17/release/vs_BuildTools.exe).
+2. Select the **Desktop development with C++** workload.
+3. Confirm that **MSVC v143 - VS 2022 C++ x64/x86 build tools** and a Windows 11 or Windows 10 SDK are checked.
+4. Restart Windows if asked, then run `Compile-AzerothCore-Playerbots.bat` again; the script detects the existing toolset and skips the installation.
 ### Boost installation fails
 
 Keep the repository in a short path. A path containing spaces used to break the
