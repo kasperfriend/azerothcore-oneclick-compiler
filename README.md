@@ -345,6 +345,30 @@ If nothing helps, install Build Tools manually once:
 2. Select the **Desktop development with C++** workload.
 3. Confirm that **MSVC v143 - VS 2022 C++ x64/x86 build tools** and a Windows 11 or Windows 10 SDK are checked.
 4. Restart Windows if asked, then run `Compile-AzerothCore-Playerbots.bat` again; the script detects the existing toolset and skips the installation.
+### Boost installation fails
+
+Keep the repository in a short path. A path containing spaces used to break the
+silent Boost installer, which then installed to a truncated directory and the
+script reported:
+
+```text
+FATAL: Boost headers missing after install.
+```
+
+The installer path is now quoted, so a spaced path such as
+`C:\Users\John Smith\Desktop\ACore` works. If you hit this message anyway, check
+the Boost installer's own log:
+
+```text
+logs\boost-install.log
+```
+
+It records the directory Boost actually used. Delete any half-installed
+`Dependencies\boost_1_87_0` folder and run the BAT again.
+
+If you already have Boost 1.87 installed, set `BOOST_ROOT` to a folder that
+contains both `boost\version.hpp` and `lib64-msvc-14.3`; the compiler will use it
+instead of downloading anything.
 
 ### Existing server is detected unexpectedly
 
