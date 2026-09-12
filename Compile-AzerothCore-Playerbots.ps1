@@ -87,7 +87,14 @@ function Invoke-Native {
         $ErrorActionPreference = $oldErrorAction
         Set-Location $old
     }
-    if (($code -ne 0) -and (-not $AllowFailure)) { throw "Command failed ($code): $FilePath" }
+    if (($code -ne 0) -and (-not $AllowFailure)) {
+        if (Test-Path $InstallLog) {
+            Write-Host "`n--- LAST 15 LINES OF LOG ---" -ForegroundColor Red
+            Get-Content $InstallLog -Tail 15 | Write-Host -ForegroundColor Red
+            Write-Host "----------------------------`n" -ForegroundColor Red
+        }
+        throw "Command failed ($code): $FilePath"
+    }
     return $code
 }
 function Invoke-HttpDownloadWithProgress {
@@ -677,7 +684,10 @@ try {
     )
     Invoke-Native $cmake $cmakeArgs
     Write-Step 'Compiling AzerothCore + Playerbots (this can take 5-45 minutes)'
-    Invoke-Native $cmake @('--build',$BuildDir,'--config','RelWithDebInfo','--target','INSTALL','--parallel',[Environment]::ProcessorCount)
+    $mem = Get-CimInstance Win32_OperatingSystem | Select-Object -ExpandProperty TotalVisibleMemorySize
+    $maxJobs = [math]::Max(1, [math]::Floor($mem / 1024 / 2048)) # 2GB per core for MSBuild
+    $jobs = [math]::Min([Environment]::ProcessorCount, $maxJobs)
+    Invoke-Native $cmake @('--build',$BuildDir,'--config','RelWithDebInfo','--target','INSTALL','--parallel',$jobs)
     Copy-RuntimeFiles $openssl
 
     Write-Step 'Configuring portable database and server'
