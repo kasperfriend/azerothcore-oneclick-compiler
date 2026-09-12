@@ -324,20 +324,75 @@ function Install-OpenSSL {
     if (-not (Test-Path (Join-Path $root 'include\openssl\ssl.h'))) { throw 'OpenSSL headers missing after extraction.' }
     return $root
 }
+function Test-BoostRoot {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    return ((Test-Path (Join-Path $Path 'boost\version.hpp')) -and (Test-Path (Join-Path $Path 'lib64-msvc-14.3')))
+}
+function Write-BoostFailureDetail {
+    param([string]$Root,[string]$SetupLog,[string]$ExitCodeText)
+    Write-Log "Boost verification failed (installer exit code: $ExitCodeText)."
+    Write-Log "Expected headers at: $(Join-Path $Root 'boost\version.hpp')"
+    Write-Log "Expected libraries at: $(Join-Path $Root 'lib64-msvc-14.3')"
+    if (Test-Path $Root) {
+        $children = @(Get-ChildItem $Root -Force -ErrorAction SilentlyContinue | Select-Object -First 25 | ForEach-Object { $_.Name })
+        if ($children.Count -gt 0) { Write-Log "Contents of $Root (first 25 entries) -> $($children -join ', ')" }
+        else { Write-Log "Folder $Root exists but is empty." }
+    } else {
+        Write-Log "Folder $Root was never created."
+    }
+    if ((Test-Path $SetupLog) -and ((Get-Item $SetupLog).Length -gt 0)) {
+        Write-Log "Tail of the Boost installer log ($SetupLog):"
+        foreach ($line in @(Get-Content $SetupLog -Tail 30 -ErrorAction SilentlyContinue)) { Write-Log "    $line" }
+    } else {
+        Write-Log "No Boost installer log was written to $SetupLog."
+    }
+}
 function Install-Boost {
     $root = Join-Path $DepsDir $BoostDirName
-    if ((Test-Path (Join-Path $root 'boost\version.hpp')) -and (Test-Path (Join-Path $root 'lib64-msvc-14.3'))) { return $root }
-    if ($env:BOOST_ROOT -and (Test-Path (Join-Path $env:BOOST_ROOT 'boost\version.hpp')) -and (Test-Path (Join-Path $env:BOOST_ROOT 'lib64-msvc-14.3'))) { return $env:BOOST_ROOT }
+    if (Test-BoostRoot $root) { return $root }
+    if ($env:BOOST_ROOT -and (Test-BoostRoot $env:BOOST_ROOT)) { return $env:BOOST_ROOT }
     Write-Step "Installing Boost $BoostVersion"
     $installer = Join-Path $DownloadsDir 'boost.exe'
     # Use Boost's own archive host. SourceForge is intentionally not used.
     # Download-Verified automatically tries IWR, BITS, and curl.exe.
     Download-Verified $BoostUrl $installer $BoostSha256 200000000
-    New-Item -ItemType Directory -Force -Path $root | Out-Null
-    $p = Start-Process $installer -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',("/DIR={0}" -f $root) -Wait -PassThru
-    if ($p.ExitCode -ne 0) { throw "Boost installer failed: $($p.ExitCode)" }
-    if (-not (Test-Path (Join-Path $root 'boost\version.hpp'))) { throw 'Boost headers missing after install.' }
-    return $root
+    $setupLog = Join-Path $LogDir 'boost-install.log'
+
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        # A half-populated folder from an earlier failed attempt is not a clean
+        # target, so the installer always receives an empty directory.
+        if (Test-Path $root) { Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue }
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        Remove-Item $setupLog -Force -ErrorAction SilentlyContinue
+
+        # The argument line is deliberately ONE pre-quoted string. Start-Process
+        # joins an -ArgumentList array with plain spaces and never quotes an
+        # element (StartProcessCommand: startInfo.Arguments = string.Join(' ', ArgumentList)),
+        # so the previous "/DIR=$root" form was truncated at the first space of
+        # the install path. Boost then installed elsewhere, still returned exit
+        # code 0, and the failure surfaced as 'Boost headers missing after install.'
+        $argLine = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /NOCANCEL /DIR="{0}" /LOG="{1}"' -f $root, $setupLog
+        Write-Log "> $installer $argLine"
+        $p = Start-Process $installer -ArgumentList $argLine -Wait -PassThru
+        if ($p) { try { $p.WaitForExit() } catch { } }
+        $codeText = 'unknown'
+        if ($p -and ($null -ne $p.ExitCode)) { $codeText = [string]$p.ExitCode }
+
+        # Absorb the window where the installer has returned but the extracted
+        # tree has not finished being flushed to disk.
+        $deadline = (Get-Date).AddSeconds(30)
+        while (-not (Test-BoostRoot $root) -and ((Get-Date) -lt $deadline)) { Start-Sleep -Milliseconds 500 }
+
+        if (Test-BoostRoot $root) {
+            Write-Log "Boost $BoostVersion is installed in $root"
+            return $root
+        }
+        Write-BoostFailureDetail $root $setupLog $codeText
+        # A genuine installer failure code will not improve on a second attempt.
+        if (($codeText -ne '0') -and ($codeText -ne 'unknown')) { break }
+    }
+    throw "Boost $BoostVersion could not be installed into $root (installer exit code: $codeText). Review $setupLog and $InstallLog. Alternatively set BOOST_ROOT to an existing Boost $BoostVersion folder that contains boost\version.hpp and lib64-msvc-14.3, then run the script again."
 }
 function Install-PortableMySQL {
     if ((Test-Path (Join-Path $MySqlDir 'bin\mysqld.exe')) -and (Test-Path (Join-Path $MySqlDir 'lib\mysqlclient.lib'))) { return }
