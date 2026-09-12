@@ -24,17 +24,20 @@ Keep the BAT and PS1 files together in the same directory.
 - 64-bit Windows
 - Administrator access
 - Internet connection
-- Several gigabytes of free disk space
+- About 40 GB of free disk space: roughly 15 GB for the Visual Studio C++ Build Tools and its package cache, plus Boost, OpenSSL, MySQL, the sources and the build output. The script refuses to start the Visual Studio installation when less than 12 GB is free on the relevant drive.
+- A local NTFS drive. Network shares, removable drives and substituted (`subst`) drives are rejected by the Visual Studio installer.
 - A legally obtained World of Warcraft 3.3.5a client, build 12340, for client-data extraction or pre-extracted data files from *elsewhere*
 
 ## Quick start
 
 1. Download or clone this repository.
-2. Place it in the directory where you want the complete installation. A short path is recommended, for example:
+2. Place it in the directory where you want the complete installation. A short path without spaces or non-ASCII characters is strongly recommended, for example:
 
    ```text
    E:\ACore
    ```
+
+   Avoid leaving it in a deep download folder such as `C:\Users\NAME\Downloads\azerothcore-oneclick-compiler-main`, because the Visual Studio installer and the MSVC toolchain work with paths far below that folder.
 
 3. Double-click:
 
@@ -296,9 +299,20 @@ The script needs the Visual Studio 2022 x64 C++ toolset (`Microsoft.VisualStudio
 When the installation fails, the script now reports exactly what happened:
 
 - the free disk space on the installation, cache and `%TEMP%` drives,
+- whether the target directory itself is usable for Visual Studio,
 - a pending Windows restart, a non-writable `%TEMP%`, or a blocked Microsoft download endpoint,
 - the exit code of every attempt, translated into plain language,
 - the failing lines from the Microsoft installer logs, which are copied into `logs\vsinstaller`.
+
+The target directory is validated before the installer runs, because Visual Studio rejects unsuitable directories with error `8004` without explaining why. The portable `Dependencies\VSBuildTools` location is skipped when it is:
+
+- on a network share, a removable drive, or a substituted (`subst`) drive,
+- on a volume that is not NTFS,
+- inside a folder that cannot be written to,
+- longer than 120 characters (a warning is already shown above 80 characters),
+- containing non-ASCII characters (warning).
+
+In those cases Build Tools is installed into the default system location, `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools`, instead. Moving the whole compiler to a short local path such as `E:\ACore` keeps the portable layout working.
 
 It then automatically retries with a different strategy before giving up:
 
@@ -308,7 +322,7 @@ It then automatically retries with a different strategy before giving up:
 4. Install Build Tools into the default system location without the download cache.
 5. Install Build Tools through `winget`, when `winget` is available.
 
-Retries are skipped when they cannot help, for example when the installation was canceled, when a restart is required, or when the Microsoft servers cannot be reached.
+Steps 2 and 3 are skipped once the target directory has been rejected, and retries are skipped entirely when they cannot help, for example when the installation was canceled, when a restart is required, or when the Microsoft servers cannot be reached.
 
 Common exit codes reported by the Microsoft bootstrapper:
 
@@ -322,7 +336,7 @@ Common exit codes reported by the Microsoft bootstrapper:
 | `3010`, `1641` | Succeeded, restart required | Restart Windows, then run the script again. |
 | `5003`, `-1073720687` | Microsoft servers unreachable | Allow `aka.ms`, `download.visualstudio.microsoft.com` and `*.vsassets.io` in the proxy, firewall, DNS filter and antivirus. |
 | `5007`, `8010` | Requirements not met | Install current Windows updates; Windows 10/11 x64 is required. |
-| `8004` | Target directory unusable | Delete `Dependencies\VSBuildTools`, or install to a short local path such as `E:\ACore`. |
+| `8004` | Target directory failure | The script now detects the usual causes up front and falls back to the default location. Otherwise move the compiler to a short local NTFS path such as `E:\ACore`, avoid network/removable/`subst` drives, and delete a leftover `Dependencies\VSBuildTools`. |
 | `8005` | Corrupt cached package | Delete `Dependencies\Downloads` and run the script again. |
 
 If nothing helps, install Build Tools manually once:

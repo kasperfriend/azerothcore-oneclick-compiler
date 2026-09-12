@@ -299,15 +299,97 @@ function Format-FreeGB {
 }
 function Get-FreeSpaceGB {
     param([string]$Path)
+    $disk = Get-LogicalDisk $Path
+    if ($disk -and $disk.FreeSpace -gt 0) { return [math]::Round([double]$disk.FreeSpace / 1GB,1) }
+    return $null
+}
+function Get-LogicalDisk {
+    param([string]$Path)
     try {
         if (-not $Path) { return $null }
         $root = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($Path))
         if (-not $root) { return $null }
         $deviceId = $root.TrimEnd('\').Replace("'","''")
-        $disk = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $deviceId) -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($disk -and $disk.FreeSpace -gt 0) { return [math]::Round([double]$disk.FreeSpace / 1GB,1) }
+        return Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $deviceId) -ErrorAction SilentlyContinue | Select-Object -First 1
     } catch { }
     return $null
+}
+function Test-InstallPathUsable {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    # Visual Studio rejects some target directories with error 8004 ("target
+    # directory failure") before it downloads anything. Detecting the cause here
+    # avoids a long, opaque installation failure.
+    $blockers = @()
+    $warnings = @()
+    $full = $Path
+    try { $full = [IO.Path]::GetFullPath($Path) } catch { $blockers += ('The path could not be resolved: {0}' -f $_.Exception.Message) }
+
+    if ($full.StartsWith('\\')) { $blockers += 'A UNC/network path cannot host a Visual Studio installation; use a local fixed drive.' }
+
+    $disk = Get-LogicalDisk $full
+    if ($disk) {
+        # DriveType: 2 = removable, 3 = fixed, 4 = network, 5 = CD, 6 = RAM disk.
+        if ($disk.DriveType -eq 4) { $blockers += ('Drive {0} is a network drive; Visual Studio must be installed on a local fixed drive.' -f $disk.DeviceID) }
+        elseif ($disk.DriveType -eq 2) { $blockers += ('Drive {0} is removable (USB/SD); Visual Studio installation onto removable media is unreliable and often rejected.' -f $disk.DeviceID) }
+        elseif ($disk.DriveType -ne 3) { $blockers += ('Drive {0} is not a fixed local disk (DriveType {1}).' -f $disk.DeviceID,$disk.DriveType) }
+        if ($disk.FileSystem -and $disk.FileSystem -notin @('NTFS','ReFS')) { $blockers += ('Drive {0} uses {1}; Visual Studio requires NTFS.' -f $disk.DeviceID,$disk.FileSystem) }
+        Write-Log ('Install target drive {0}: type {1}, file system {2}' -f $disk.DeviceID,$disk.DriveType,$disk.FileSystem)
+    } elseif (-not $full.StartsWith('\\')) {
+        $blockers += ('The drive for {0} could not be queried; it may be a substituted (subst) or otherwise unsupported volume.' -f $full)
+    }
+
+    $parent = [IO.Path]::GetDirectoryName($full)
+    if ($parent -and (Test-Path $parent)) {
+        try {
+            $probe = Join-Path $parent ('acore-path-probe-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+            [IO.File]::WriteAllText($probe,'ok')
+            Remove-Item $probe -Force -ErrorAction SilentlyContinue
+        } catch { $blockers += ('The parent folder {0} is not writable: {1}' -f $parent,$_.Exception.Message) }
+    }
+
+    # MSVC and the Windows SDK nest deeply below the install root; the default
+    # location itself is 61 characters long.
+    $length = $full.Length
+    if ($length -gt 120) { $blockers += ('The installation path is {0} characters long ({1}). Visual Studio fails with error 8004 on paths this deep; use a short location such as E:\ACore.' -f $length,$full) }
+    elseif ($length -gt 80) { $warnings += ('The installation path is {0} characters long ({1}). Long paths can break the Visual Studio installer and the MSVC toolchain; a shorter location such as E:\ACore is safer.' -f $length,$full) }
+
+    if ($full -match '[^\x20-\x7E]') { $warnings += ('The installation path contains non-ASCII characters ({0}), which the Visual Studio installer and MSVC do not always handle.' -f $full) }
+
+    # Substituted drives look like fixed local disks to WMI, but the Visual
+    # Studio installer rejects them with error 8004.
+    $driveLetter = ''
+    try { $driveLetter = [IO.Path]::GetPathRoot($full).TrimEnd('\') } catch { }
+    if ($driveLetter.Length -ge 2) {
+        $substLines = @()
+        $oldErrorAction = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $substExe = Join-Path $env:SystemRoot 'System32\subst.exe'
+            if (Test-Path $substExe) { $substLines = @(& $substExe 2>$null) }
+        } catch { } finally { $ErrorActionPreference = $oldErrorAction }
+        foreach ($line in $substLines) {
+            $text = "$line"
+            if ($text -match '^\s*([A-Za-z]):\\?\s*=>') {
+                if ($Matches[1].ToUpperInvariant() -eq $driveLetter.Substring(0,1).ToUpperInvariant()) {
+                    $blockers += ('Drive {0} is a substituted (subst) drive: {1}. Visual Studio rejects substituted drives with error 8004; use the real path instead.' -f $driveLetter,$text.Trim())
+                }
+            }
+        }
+    }
+
+    if (Test-Path $full) {
+        $existing = @(Get-ChildItem $full -Force -ErrorAction SilentlyContinue)
+        if ($existing.Count -gt 0) { $warnings += ('{0} already exists and contains {1} item(s) from an earlier attempt; it is cleaned up automatically when no Visual Studio instance is registered there.' -f $full,$existing.Count) }
+    }
+
+    foreach ($w in $warnings) { Write-Log ('WARNING: ' + $w) -Color Yellow }
+    foreach ($b in $blockers) { Write-Log ('BLOCKER: ' + $b) -Color Red }
+    return [pscustomobject]@{
+        Path = $full
+        Usable = ($blockers.Count -eq 0)
+        Blockers = $blockers
+        Warnings = $warnings
+    }
 }
 function Get-PendingRebootReasons {
     $reasons = @()
@@ -550,7 +632,13 @@ function Install-BuildTools {
 
     Write-Step 'Installing Visual Studio 2022 C++ Build Tools (large download)'
     $vsLocal = Join-Path $DepsDir 'VSBuildTools'
-    Test-BuildToolsReadiness $vsLocal
+    $pathCheck = Test-InstallPathUsable $vsLocal
+    if ($pathCheck.Usable) {
+        Test-BuildToolsReadiness $vsLocal
+    } else {
+        Write-Log ('The portable location {0} cannot host Build Tools, so it will be installed into the default system location instead.' -f $vsLocal) -Color Yellow
+        Test-BuildToolsReadiness "${env:ProgramFiles(x86)}\Microsoft Visual Studio"
+    }
 
     $bootstrap = Join-Path $DownloadsDir 'vs_buildtools.exe'
     Download-Verified 'https://aka.ms/vs/17/release/vs_BuildTools.exe' $bootstrap '' 1000000
@@ -566,6 +654,7 @@ function Install-BuildTools {
     # Ordered recovery strategies. Every attempt is verified with vswhere, so a
     # run that reports success without providing the toolset is retried.
     $attempts = New-Object Collections.Generic.List[object]
+    $report = New-Object Collections.Generic.List[string]
     if ($instances.Count -gt 0) {
         $modifyTarget = @($instances | Where-Object { $_ -and ([IO.Path]::GetFullPath($_).TrimEnd('\') -eq [IO.Path]::GetFullPath($vsLocal).TrimEnd('\')) })
         if ($modifyTarget.Count -eq 0) { $modifyTarget = @($instances[0]) }
@@ -580,28 +669,36 @@ function Install-BuildTools {
             Arguments = (@('modify','--installPath',$modifyTarget[0]) + $common + $payload)
             ResetPath = $false
             IsVSBootstrapper = $true
+            UsesInstallPath = $false
         })
     }
-    $attempts.Add([pscustomobject]@{
-        Name = ('install Build Tools into {0} with a progress window' -f $vsLocal)
-        FilePath = $bootstrap
-        Arguments = (@('--passive','--installPath',$vsLocal) + $common + $payload)
-        ResetPath = $true
-        IsVSBootstrapper = $true
-    })
-    $attempts.Add([pscustomobject]@{
-        Name = ('install Build Tools into {0} without any user interface' -f $vsLocal)
-        FilePath = $bootstrap
-        Arguments = (@('--quiet','--installPath',$vsLocal) + $common + $payload)
-        ResetPath = $true
-        IsVSBootstrapper = $true
-    })
+    if ($pathCheck.Usable) {
+        $attempts.Add([pscustomobject]@{
+            Name = ('install Build Tools into {0} with a progress window' -f $vsLocal)
+            FilePath = $bootstrap
+            Arguments = (@('--passive','--installPath',$vsLocal) + $common + $payload)
+            ResetPath = $true
+            IsVSBootstrapper = $true
+            UsesInstallPath = $true
+        })
+        $attempts.Add([pscustomobject]@{
+            Name = ('install Build Tools into {0} without any user interface' -f $vsLocal)
+            FilePath = $bootstrap
+            Arguments = (@('--quiet','--installPath',$vsLocal) + $common + $payload)
+            ResetPath = $true
+            IsVSBootstrapper = $true
+            UsesInstallPath = $true
+        })
+    } else {
+        $report.Add(('install into {0} -> skipped, the target directory was rejected before the installer ran: {1}' -f $vsLocal,($pathCheck.Blockers -join ' ')))
+    }
     $attempts.Add([pscustomobject]@{
         Name = 'install Build Tools into the default system location without the download cache'
         FilePath = $bootstrap
         Arguments = (@('--passive','--nocache') + $common + $payload)
         ResetPath = $false
         IsVSBootstrapper = $true
+        UsesInstallPath = $false
     })
     $winget = Get-Exe 'winget.exe'
     if ($winget) {
@@ -611,11 +708,16 @@ function Install-BuildTools {
             Arguments = @('install','--id','Microsoft.VisualStudio.2022.BuildTools','--exact','--source','winget','--silent','--accept-source-agreements','--accept-package-agreements','--override',('--passive --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended'))
             ResetPath = $false
             IsVSBootstrapper = $false
+            UsesInstallPath = $false
         })
     }
 
-    $report = New-Object Collections.Generic.List[string]
+    $customPathRejected = (-not $pathCheck.Usable)
     foreach ($attempt in $attempts) {
+        if ($attempt.UsesInstallPath -and $customPathRejected) {
+            $report.Add(('{0} -> skipped, the target directory {1} was rejected.' -f $attempt.Name,$vsLocal))
+            continue
+        }
         Write-Host ''
         Write-Log ('Attempt: ' + $attempt.Name) -Color Cyan
         if ($attempt.ResetPath) { Reset-StaleBuildToolsPath $vsLocal @(Get-VSInstancePaths) }
@@ -640,6 +742,12 @@ function Install-BuildTools {
             Write-VSLogSummary $logs
             $stopReason = Get-VSStopReason $code
             if ($stopReason) { throw $stopReason }
+            if ($code -eq 8004) {
+                # The installer rejected the target directory itself, so every
+                # remaining attempt that reuses it would fail the same way.
+                $customPathRejected = $true
+                Write-Log ('Target directory {0} was rejected (8004); remaining attempts that use it are skipped.' -f $vsLocal) -Color Yellow
+            }
             $report.Add(('{0} -> exit code {1}: {2}' -f $attempt.Name,$code,$meaning))
         } else {
             Write-Log ('Attempt failed with exit code {0}.' -f $code) -Color Red
@@ -653,7 +761,8 @@ function Install-BuildTools {
     throw (@(
         ('VS Build Tools could not be installed after {0} attempt(s).' -f $attempts.Count),
         'The Microsoft installer logs were copied into logs\vsinstaller; the failing lines are printed above and stored in logs\install.log.',
-        'The usual causes of the generic exit code 1 are: too little free disk space, antivirus/group policy/proxy blocking download.visualstudio.com, a pending Windows restart, or a damaged existing Visual Studio installation.',
+        'Usual causes of exit code 1: too little free disk space, antivirus/group policy/proxy blocking download.visualstudio.com, a pending Windows restart, or a damaged existing Visual Studio installation.',
+        'Usual causes of exit code 8004: a network, removable or substituted drive, a non-NTFS volume, an unwritable or non-empty target folder, or an installation path that is too long or contains non-ASCII characters.',
         'Fix the reported cause, or install the "Desktop development with C++" workload manually with Build Tools for Visual Studio 2022, then run Compile-AzerothCore-Playerbots.bat again.',
         'See README.md > Troubleshooting > "Visual Studio Build Tools installation fails" for the exit-code table.',
         'When reporting this failure, attach logs\install.log together with the logs\vsinstaller folder.'
