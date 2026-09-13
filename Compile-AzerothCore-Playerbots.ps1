@@ -1210,6 +1210,27 @@ try {
     Write-Step 'Configuring CMake'
     if ($ForceRebuild -and (Test-Path $BuildDir)) { Remove-Item $BuildDir -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $BuildDir,$ServerDir | Out-Null
+
+    # The core auto-includes conf\config.cmake when it exists (and gitignores
+    # it), so this is the supported way to add build-wide CMake settings.
+    # Defining the Windows target macros for every translation unit - core,
+    # dependencies and modules alike - stops Boost.Asio and the Windows SDK
+    # headers from printing (or, on older SDKs, failing with) "Please define
+    # _WIN32_WINNT or _WIN32_WINDOWS appropriately" around module compilation.
+    $coreConfDir = Join-Path $SourceDir 'conf'
+    New-Item -ItemType Directory -Force -Path $coreConfDir | Out-Null
+    $coreConf = Join-Path $coreConfDir 'config.cmake'
+    $targetDefLine = 'add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00)'
+    if (Test-Path $coreConf) {
+        $existingConf = [IO.File]::ReadAllText($coreConf)
+        if ($existingConf -notmatch [regex]::Escape($targetDefLine)) {
+            [IO.File]::AppendAllText($coreConf, "`r`n$targetDefLine`r`n", (New-Object Text.UTF8Encoding($false)))
+        }
+    } else {
+        $confText = "# Written by Compile-AzerothCore-Playerbots.ps1 (regenerated on every run).`r`n$targetDefLine`r`n"
+        [IO.File]::WriteAllText($coreConf, $confText, (New-Object Text.UTF8Encoding($false)))
+    }
+
     $cmakeArgs = @(
         '-S',$SourceDir,'-B',$BuildDir,'-G','Visual Studio 17 2022','-A','x64',
         "-DCMAKE_INSTALL_PREFIX=$($ServerDir.Replace('\','/'))",
