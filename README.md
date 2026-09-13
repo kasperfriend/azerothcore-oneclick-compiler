@@ -402,6 +402,19 @@ Server\Data\maps
 
 The presence of empty directories is not sufficient.
 
+### "Please define _WIN32_WINNT or _WIN32_WINDOWS appropriately" during compilation
+
+This message is printed by Boost.Asio, which AzerothCore and many modules include. It appears when a source file pulls in Windows or Boost headers before the Windows target macros (`_WIN32_WINNT` / `WINVER`) have been defined. With older Windows SDKs it can be a hard error; with current SDKs it is only a warning, and the compiler continues by assuming a Windows 7 target.
+
+The compiler now pins a Windows 10 baseline for the whole build — core, dependencies and every module — by writing `add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00)` into `Dependencies\Source\conf\config.cmake`. AzerothCore automatically includes that file, so this message no longer appears in this script's builds.
+
+If you compile AzerothCore by hand and still see it, add the same line to your own `conf\config.cmake`, or define the macros before any `<windows.h>` or Boost header:
+
+```cmake
+# conf/config.cmake
+add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00)
+```
+
 ## Upstream documentation
 
 - [AzerothCore installation guide](https://www.azerothcore.org/wiki/classic-installation)
