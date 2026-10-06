@@ -14,6 +14,8 @@
 param(
     [string]$InstallRoot = '',
     [ValidateRange(1024,65535)][int]$DatabasePort = 3307,
+    # 0 = size the build automatically from the memory actually available.
+    [ValidateRange(0,64)][int]$Jobs = 0,
     [switch]$ForceRebuild
 )
 
@@ -40,6 +42,17 @@ $BoostSha256 = '7b204c1cfa1a41f771361d23a99d3b4d5d677d7b52064eb73f37ba47b2d238bb
 $MySqlVersion = '8.4.9'
 $MySqlUrl = 'https://cdn.mysql.com/archives/mysql-8.4/mysql-8.4.9-winx64.zip'
 $MySqlSha256 = '5795ba250e89290f7507ed3bcc6a655be373616abb58b877acdea71e1b8f4e8c'
+
+# Memory model for the build. Two multipliers run at once: MSBuild builds several
+# projects in parallel (cmake --parallel => /m:N) and each cl.exe invocation can
+# fan out to several compiler processes because the core enables /MP. Sizing for
+# the product is what keeps MSVC from dying with C1060/C1076/LNK1102 on machines
+# that looked big enough when only the node count was considered.
+# $MemoryPerCompilerMB is an empirical working figure for the heaviest playerbots
+# translation units compiled as RelWithDebInfo with debug information; the reserve
+# in Get-BuildPlan sits on top of it.
+$MemoryPerCompilerMB = 1500
+$MaxCompilersPerNode = 2
 
 $InstallRoot = if ($InstallRoot) { [IO.Path]::GetFullPath($InstallRoot) } else { $PSScriptRoot }
 $DepsDir = Join-Path $InstallRoot 'Dependencies'
@@ -102,6 +115,81 @@ function Invoke-Native {
         throw "Command failed ($code): $FilePath"
     }
     return $code
+}
+function Get-BuildPlan([int]$RequestedJobs) {
+    $os = Get-CimInstance Win32_OperatingSystem
+    $cores = [Environment]::ProcessorCount
+    $totalMB = [math]::Floor($os.TotalVisibleMemorySize / 1024)
+    $freeMB = [math]::Floor($os.FreePhysicalMemory / 1024)
+    $virtualMB = [math]::Floor($os.TotalVirtualMemorySize / 1024)
+    # "Free" memory excludes the standby cache, so a healthy idle machine reports
+    # very little of it. The performance counter reports what Windows can actually
+    # hand out (the Task Manager "Available" figure). It is localized, so fall back
+    # to the raw free figure when it is unavailable.
+    $availableMB = 0
+    try {
+        $sample = Get-Counter '\Memory\Available MBytes' -ErrorAction Stop | Select-Object -ExpandProperty CounterSamples | Select-Object -First 1
+        if ($sample) { $availableMB = [math]::Floor($sample.CookedValue) }
+    } catch { $availableMB = 0 }
+    if ($availableMB -le 0) { $availableMB = $freeMB }
+    # Reserve room for Windows, antivirus, the compiler's own driver, and whatever
+    # the user has open. Total RAM is deliberately not used: a machine that is
+    # already busy must build with fewer jobs, not the same number as an idle one.
+    $reserveMB = [math]::Max(3072, [math]::Floor($totalMB * 0.15))
+    $budgetMB = $availableMB - $reserveMB
+    # How many compiler processes the memory budget can carry. The product of the
+    # two multipliers is what matters, so the node count is derived from this
+    # figure and from how many compilers each node is allowed to run.
+    $budgetCompilers = [math]::Max(1, [math]::Floor($budgetMB / $MemoryPerCompilerMB))
+    $perNode = [math]::Min($MaxCompilersPerNode, $budgetCompilers)
+    $nodes = [math]::Max(1, [math]::Floor($budgetCompilers / $perNode))
+    $jobs = [math]::Min($cores, $nodes)
+    if ($RequestedJobs -gt 0) { $jobs = [math]::Min($RequestedJobs, $cores) }
+    return [pscustomobject]@{
+        Jobs      = [int]$jobs
+        Compilers = [int]$perNode
+        Budget    = [int]$budgetCompilers
+        Cores     = [int]$cores
+        TotalMB   = [int]$totalMB
+        FreeMB    = [int]$freeMB
+        Available = [int]$availableMB
+        VirtualMB = [int]$virtualMB
+        BudgetMB  = [int]$budgetMB
+        ReserveMB = [int]$reserveMB
+        Requested = [int]$RequestedJobs
+    }
+}
+function Write-BuildPlan($Plan) {
+    $totalGB = [math]::Round($Plan.TotalMB / 1024.0, 1)
+    $availGB = [math]::Round($Plan.Available / 1024.0, 1)
+    $budgetGB = [math]::Round($Plan.BudgetMB / 1024.0, 1)
+    $peakMB = $Plan.Jobs * $Plan.Compilers * $MemoryPerCompilerMB
+    Write-Log ('Build plan: {0} MSBuild node(s) x {1} compiler process(es) = at most {2} cl.exe on {3} logical core(s), within a {4} compiler budget; {5} GB of {6} GB RAM available, {7} GB budgeted, ~{8} GB peak.' -f `
+        $Plan.Jobs,$Plan.Compilers,($Plan.Jobs * $Plan.Compilers),$Plan.Cores,$Plan.Budget,$availGB,$totalGB,$budgetGB,[math]::Round($peakMB / 1024.0, 1))
+    if ($Plan.Requested -gt 0) {
+        Write-Log ('Using -Jobs {0}; automatic memory-based sizing was overridden.' -f $Plan.Requested) 'Yellow'
+        if ($peakMB -gt [math]::Max(0, $Plan.BudgetMB)) {
+            Write-Log ('Warning: {0} job(s) with {1} compiler process(es) each can need about {2} GB, more than the {3} GB currently budgeted. Expect paging, or out-of-memory compiler errors on a machine that is already busy.' -f $Plan.Jobs,$Plan.Compilers,[math]::Round($peakMB / 1024.0, 1),$budgetGB) 'Yellow'
+        }
+    }
+    if ($Plan.TotalMB -lt 8192) {
+        Write-Log ('Warning: this machine has {0} GB of RAM. The playerbots build is comfortable from 8 GB (16 GB recommended) and may need a larger page file below that.' -f $totalGB) 'Yellow'
+    }
+    if ($Plan.Available -lt 4096) {
+        Write-Log ('Warning: only {0} GB of RAM is available right now. Close browsers and other large programs before compiling if the build fails.' -f $availGB) 'Yellow'
+    }
+    if ($Plan.VirtualMB -lt ($Plan.TotalMB * 1.25)) {
+        Write-Log 'Warning: the Windows page file looks small or disabled. Linking worldserver.exe can need several GB and fails with LNK1102 when there is nowhere to spill.' 'Yellow'
+    }
+}
+function Get-OutOfMemoryHint {
+    if (-not (Test-Path $InstallLog)) { return '' }
+    $tail = Get-Content $InstallLog -Tail 400 -ErrorAction SilentlyContinue
+    if (-not $tail) { return '' }
+    $hit = $tail | Select-String -Pattern 'out of heap space','internal heap limit','compiler is out of heap','LNK1102','out of memory','virtual memory','C1060','C1076' | Select-Object -First 1
+    if (-not $hit) { return '' }
+    $line = $hit.Line.Trim()
+    return ('MSVC ran out of memory during compilation ({0}). The compiler can need several GB per process on this codebase. In order: 1) close browsers and other large programs and run the compiler again; 2) re-run with fewer parallel jobs, for example: powershell -File Compile-AzerothCore-Playerbots.ps1 -Jobs 2; 3) enlarge the Windows page file (System > Advanced system settings > Performance > Advanced > Virtual memory); 4) 16 GB of RAM is the recommended amount for this build.' -f $line)
 }
 function Invoke-HttpDownloadWithProgress {
     param([string]$Uri,[string]$Destination)
@@ -1215,25 +1303,58 @@ try {
     if ($ForceRebuild -and (Test-Path $BuildDir)) { Remove-Item $BuildDir -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $BuildDir,$ServerDir | Out-Null
 
+    # Measure once, before anything is compiled: the same plan drives the CMake
+    # settings below and the MSBuild command line further down.
+    $plan = Get-BuildPlan $Jobs
+
     # The core auto-includes conf\config.cmake when it exists (and gitignores
     # it), so this is the supported way to add build-wide CMake settings.
+    # The block between the markers is regenerated on every run; anything else in
+    # the file is left alone.
+    $managedStart = '# --- managed by Compile-AzerothCore-Playerbots.ps1 ---'
+    $managedEnd = '# --- end managed block ---'
+    $coreConfDir = Join-Path $SourceDir 'conf'
+    New-Item -ItemType Directory -Force -Path $coreConfDir | Out-Null
+    $coreConf = Join-Path $coreConfDir 'config.cmake'
     # Defining the Windows target macros for every translation unit - core,
     # dependencies and modules alike - stops Boost.Asio and the Windows SDK
     # headers from printing (or, on older SDKs, failing with) "Please define
     # _WIN32_WINNT or _WIN32_WINDOWS appropriately" around module compilation.
-    $coreConfDir = Join-Path $SourceDir 'conf'
-    New-Item -ItemType Directory -Force -Path $coreConfDir | Out-Null
-    $coreConf = Join-Path $coreConfDir 'config.cmake'
-    $targetDefLine = 'add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00)'
-    if (Test-Path $coreConf) {
-        $existingConf = [IO.File]::ReadAllText($coreConf)
-        if ($existingConf -notmatch [regex]::Escape($targetDefLine)) {
-            [IO.File]::AppendAllText($coreConf, "`r`n$targetDefLine`r`n", (New-Object Text.UTF8Encoding($false)))
-        }
-    } else {
-        $confText = "# Written by Compile-AzerothCore-Playerbots.ps1 (regenerated on every run).`r`n$targetDefLine`r`n"
-        [IO.File]::WriteAllText($coreConf, $confText, (New-Object Text.UTF8Encoding($false)))
-    }
+    $managedBlock = @"
+$managedStart
+add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00)
+# AzerothCore puts a bare /MP on its compile interface, which means "one compiler
+# process per logical processor" for every project. Together with parallel MSBuild
+# projects that is what exhausts memory, so the flag is replaced with a bounded
+# one. ConfigureBaseTargets and the compiler settings are processed after this
+# file is included, hence the deferred call.
+cmake_language(DEFER CALL acore_bound_multi_processor_compilation)
+function(acore_bound_multi_processor_compilation)
+    foreach(_acore_interface IN ITEMS acore-compile-option-interface acore-default-interface acore-core-interface)
+        if(NOT TARGET `${_acore_interface})
+            continue()
+        endif()
+        get_target_property(_acore_options `${_acore_interface} INTERFACE_COMPILE_OPTIONS)
+        if(_acore_options)
+            list(FILTER _acore_options EXCLUDE REGEX "^/MP[0-9]*`$")
+        else()
+            set(_acore_options "")
+        endif()
+        list(APPEND _acore_options "/MP$($plan.Compilers)")
+        set_target_properties(`${_acore_interface} PROPERTIES INTERFACE_COMPILE_OPTIONS "`${_acore_options}")
+    endforeach()
+endfunction()
+$managedEnd
+"@
+    $existingConf = if (Test-Path $coreConf) { [IO.File]::ReadAllText($coreConf) } else { '' }
+    $withoutManaged = [regex]::Replace($existingConf, "(?s)\r?\n?" + [regex]::Escape($managedStart) + ".*?" + [regex]::Escape($managedEnd) + "\r?\n?", "`r`n")
+    # Earlier versions of this script left the definition line behind without the
+    # markers; drop it so the managed block stays the single source of it.
+    $definitionLine = 'add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00)'
+    $withoutManaged = [regex]::Replace($withoutManaged, '(?m)^[ \t]*' + [regex]::Escape($definitionLine) + '[ \t]*$', '').Trim()
+    $confText = if ($withoutManaged) { "$withoutManaged`r`n`r`n$managedBlock" } else { $managedBlock }
+    [IO.File]::WriteAllText($coreConf, $confText, (New-Object Text.UTF8Encoding($false)))
+    Write-Log ("Wrote conf\config.cmake with a /MP{0} compiler bound." -f $plan.Compilers)
 
     $cmakeArgs = @(
         '-S',$SourceDir,'-B',$BuildDir,'-G','Visual Studio 17 2022','-A','x64',
@@ -1247,10 +1368,23 @@ try {
     )
     Invoke-Native $cmake $cmakeArgs
     Write-Step 'Compiling AzerothCore + Playerbots (this can take 5-45 minutes)'
-    $mem = Get-CimInstance Win32_OperatingSystem | Select-Object -ExpandProperty TotalVisibleMemorySize
-    $maxJobs = [math]::Max(1, [math]::Floor($mem / 1024 / 2048)) # 2GB per core for MSBuild
-    $jobs = [math]::Min([Environment]::ProcessorCount, $maxJobs)
-    Invoke-Native $cmake @('--build',$BuildDir,'--config','RelWithDebInfo','--target','INSTALL','--parallel',$jobs)
+    Write-BuildPlan $plan
+    # Second layer for the same limit: conf\config.cmake replaces the core's bare
+    # /MP with /MP<n> for every project, and CL_MPCount states the same bound to
+    # MSBuild. CMake used to pass /p:CL_MPCount=1 here itself ("Having msbuild.exe
+    # and cl.exe using multiple jobs is discouraged"); 3.27 dropped it, so both
+    # layers come from this script now. The environment variable is set as well so
+    # the value is seen whichever way MSBuild resolves the property.
+    $env:CL_MPCount = $plan.Compilers
+    $buildArgs = @('--build',$BuildDir,'--config','RelWithDebInfo','--target','INSTALL','--parallel',$plan.Jobs,
+                   '--',("-p:CL_MPCount={0}" -f $plan.Compilers))
+    try {
+        Invoke-Native $cmake $buildArgs
+    } catch {
+        $hint = Get-OutOfMemoryHint
+        if ($hint) { Write-Log $hint 'Yellow' }
+        throw
+    }
     Copy-RuntimeFiles $openssl
 
     Write-Step 'Configuring portable database and server'
