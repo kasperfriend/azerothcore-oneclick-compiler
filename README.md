@@ -167,6 +167,30 @@ During a confirmed recompile:
 
 When asked for the database password during recompilation, enter the existing database password.
 
+## Pinned AzerothCore and Playerbots revisions
+
+The compiler builds an exact, CI-tested pair of revisions instead of the moving branch tips. They are defined at the top of `Compile-AzerothCore-Playerbots.ps1`:
+
+| Variable | Repository | Branch | Revision |
+| --- | --- | --- | --- |
+| `$CoreCommit` | `mod-playerbots/azerothcore-wotlk` | `Playerbot` | `f19a1879` (2026-10-02) |
+| `$ModuleCommit` | `mod-playerbots/mod-playerbots` | `master` | `037c0141` (2026-10-02) |
+
+The core's `windows-build` run for that commit checked out exactly that module revision, so the two are verified together, not only separately. After cloning, the script re-reads both revisions with `git rev-parse HEAD` and stops with `Source revision mismatch` if either one differs from the values above.
+
+Boost, OpenSSL and MySQL are pinned separately with SHA-256 hashes and normally do not change when the source revisions are bumped.
+
+### Updating to newer revisions
+
+1. Look up the current tips:
+   - core: <https://github.com/mod-playerbots/azerothcore-wotlk/commits/Playerbot>
+   - module: <https://github.com/mod-playerbots/mod-playerbots/commits/master>
+2. Open the `windows-build` run for the core tip and confirm it is green. That workflow checks out the module's `master`, so a green run proves the pair builds together on Windows.
+3. Update `$CoreCommit` and `$ModuleCommit` **together** and run the compiler again.
+4. When updating a server that already holds data, back up the `DB` folder (or the `acore_*` databases) first: newer revisions can remove or rename module tables, and worldserver applies the remaining update chain on the next data-ready start.
+
+Do not point these variables at `test-staging`, at `feature/*` branches, or at the upstream `azerothcore/azerothcore-wotlk` repository — none of those are supported by this compiler.
+
 ## Client data
 
 AzerothCore requires data extracted from a compatible World of Warcraft 3.3.5a client. Blizzard client data is not included or downloaded by this project.
