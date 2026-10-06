@@ -22,13 +22,17 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# Revisions below had successful Windows CI runs on 2026-08-28/24 respectively.
+# Revisions below had successful Windows CI runs on 2026-10-02. The core's own
+# windows-build for f19a1879 checked out exactly this module revision, so the pair
+# is verified together, not only separately. Keep both in sync: mod-playerbots
+# #2793/#2830 moved the module onto the core's modular database, so bumping one
+# without re-testing the other can fail to build or to update the databases.
 $CoreRepo = 'https://github.com/mod-playerbots/azerothcore-wotlk.git'
 $CoreBranch = 'Playerbot'
-$CoreCommit = '47960183bb03b83e8943eb2f0f39c16df9710c9d'
+$CoreCommit = 'f19a18799a35f7c24bdcdc9ea399c601f166259b'
 $ModuleRepo = 'https://github.com/mod-playerbots/mod-playerbots.git'
 $ModuleBranch = 'master'
-$ModuleCommit = '2f7d9f774987d0157c6a0d0cc08c40bec3db3945'
+$ModuleCommit = '037c01418b5d01506917a3db9b44fd56ac5f965c'
 $BoostVersion = '1.87.0'
 $BoostDirName = 'boost_1_87_0'
 $BoostUrl = 'https://archives.boost.io/release/1.87.0/binaries/boost_1_87_0-msvc-14.3-64.exe'
