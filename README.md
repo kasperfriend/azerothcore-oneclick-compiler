@@ -22,6 +22,7 @@ Keep the BAT and PS1 files together in the same directory.
 
 - Windows 10 or Windows 11
 - 64-bit Windows
+- 8 GB of RAM minimum, 16 GB recommended. The script sizes the build from the memory that is actually available and warns when it is tight, but compiling AzerothCore with Playerbots is memory-hungry.
 - Administrator access
 - Internet connection
 - About 40 GB of free disk space: roughly 15 GB for the Visual Studio C++ Build Tools and its package cache, plus Boost, OpenSSL, MySQL, the sources and the build output. The script refuses to start the Visual Studio installation when less than 12 GB is free on the relevant drive.
@@ -297,6 +298,40 @@ logs\vsinstaller
 
 When reporting a setup failure, include `install.log` and `transcript.log`. If MySQL fails, also include `mysql-error.log`. If the Visual Studio installation fails, also include the whole `logs\vsinstaller` folder.
 
+## Build parallelism and memory
+
+Compiling AzerothCore with Playerbots is the most demanding step, and it multiplies two kinds of parallelism:
+
+1. MSBuild builds several projects at once (`cmake --parallel` becomes `/m:N`).
+2. Every `cl.exe` invocation can compile several files at once, because AzerothCore enables `/MP` on its compile interface.
+
+The product of the two is what consumes memory. A machine with 16 GB can report "8 jobs" and still reach dozens of simultaneous compiler processes, which is why builds used to fail with `C1060` (compiler out of heap space), `C1076`, or `LNK1102` (linker out of memory) even though the job count looked reasonable.
+
+The compiler now measures the RAM that is actually **available** (not just the total), sets a budget aside for Windows, antivirus and the programs you have open, and then derives both numbers from that budget. It prints the plan before compiling:
+
+```text
+Build plan: 3 MSBuild node(s) x 2 compiler process(es) = at most 6 cl.exe on 16 logical core(s),
+within a 6 compiler budget; 12.4 GB of 16 GB RAM available, 9 GB budgeted, ~9 GB peak.
+```
+
+It also writes `Dependencies\Source\conf\config.cmake` (which the core includes automatically and which is not part of the source revisions) so that the core's bare `/MP` is replaced by `/MP2` for every project. The block between the `managed by` markers is rewritten on every run; anything else in that file is left untouched.
+
+### Choosing the parallelism manually
+
+Pass `-Jobs` to set the number of parallel MSBuild projects yourself:
+
+```bat
+powershell -NoProfile -ExecutionPolicy Bypass -File Compile-AzerothCore-Playerbots.ps1 -Jobs 2
+```
+
+`-Jobs 1` is the lowest-memory mode: one project at a time, with the compiler bound above applying within it. If a build fails with an out-of-memory compiler error, rerun with a smaller value. Leaving `-Jobs` out (or `-Jobs 0`) keeps the automatic sizing.
+
+Other things that help when RAM is tight:
+
+- Close browsers, launchers and other large programs before starting the build.
+- Let the page file grow: linking `worldserver.exe` with debug information can need several GB on its own. Disabling the page file makes `LNK1102` much more likely.
+- The script warns when less than 8 GB of total RAM, less than 4 GB of available RAM, or a small/disabled page file is detected.
+
 ## Security notes
 
 - The database listens only on `127.0.0.1` by default.
@@ -311,6 +346,19 @@ When reporting a setup failure, include `install.log` and `transcript.log`. If M
 ### PowerShell closes or does not start
 
 Run the BAT rather than opening the PS1 directly. Keep both files in the same directory. The BAT requests Administrator access and pauses after errors so the message remains visible.
+
+### Compilation fails with an out-of-memory error
+
+Messages such as `fatal error C1060: compiler is out of heap space`, `C1076: compiler limit: internal heap limit reached`, `LNK1102: out of memory`, or `MSB6006: "cl.exe" exited with code 2` mean the machine ran out of memory while compiling, not that the source is broken.
+
+The script prints the build plan before compiling and reports a targeted hint when it recognizes one of these messages in the log. In order:
+
+1. Close browsers and other large programs, then run the compiler again.
+2. Re-run with fewer parallel projects, for example `-Jobs 2`.
+3. Enlarge the Windows page file (System > Advanced system settings > Performance > Advanced > Virtual memory).
+4. Check the build plan line in `logs\install.log` to see how much RAM was detected as available.
+
+See [Build parallelism and memory](#build-parallelism-and-memory) for how the numbers are chosen.
 
 ### A download fails
 
